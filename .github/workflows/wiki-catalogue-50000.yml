@@ -1,0 +1,199 @@
+
+name: WikiVerse - Catalogue 50000
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  catalogue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Recuperer les statistiques
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/$GH_REPO/actions/artifacts?name=wikiverse-statistiques-30jours&per_page=100" > artifacts.json
+
+          python - <<'PY'
+          import json
+          a=json.load(open("artifacts.json"))["artifacts"]
+          a=[x for x in a if not x["expired"]]
+          if not a:
+              raise SystemExit("Statistiques introuvables")
+          a.sort(key=lambda x:x["created_at"],reverse=True)
+          open("artifact_id.txt","w").write(str(a[0]["id"]))
+          PY
+
+          ID=$(cat artifact_id.txt)
+          gh api "repos/$GH_REPO/actions/artifacts/$ID/zip" > stats.zip
+          unzip -o stats.zip
+
+      - name: Construire le catalogue
+        run: |
+          cat > build.py <<'PY'
+          import csv
+          import gzip
+          import random
+          import time
+          import json
+          import urllib.parse
+          import urllib.request
+          import heapq
+
+          SOURCE="wikiverse-views-30d.csv.gz"
+          TARGET=50000
+          random.seed(20261122)
+
+          # Selection diversifiee : articles populaires
+          # et echantillon aleatoire.
+          top=[]
+          sample=[]
+          seen=0
+
+          with gzip.open(SOURCE,"rt",encoding="utf-8") as f:
+              for row in csv.DictReader(f):
+                  try:
+                      pid=int(row["page_id"])
+                      views=int(row["views_30d"])
+                  except (ValueError,KeyError):
+                      continue
+
+                  if pid<=0:
+                      continue
+
+                  item=(pid,views)
+
+                  if len(top)<10000:
+                      heapq.heappush(top,(views,pid))
+                  elif views>top[0][0]:
+                      heapq.heapreplace(top,(views,pid))
+
+                  seen+=1
+                  if len(sample)<130000:
+                      sample.append(item)
+                  else:
+                      j=random.randrange(seen)
+                      if j<len(sample):
+                          sample[j]=item
+
+          candidates={}
+          for views,pid in top:
+              candidates[pid]=views
+          for pid,views in sample:
+              candidates[pid]=views
+
+          # Melanger les pages pour eviter de ne garder
+          # que les articles les plus populaires.
+          ids=list(candidates)
+          random.shuffle(ids)
+
+          api="https://fr.wikipedia.org/w/api.php"
+          headers={
+              "User-Agent":"WikiVerseCatalogue/2.0 (GitHub Actions; educational game)",
+              "Accept":"application/json"
+          }
+
+          def fetch(batch):
+              params=urllib.parse.urlencode({
+                  "action":"query",
+                  "format":"json",
+                  "pageids":"|".join(map(str,batch)),
+                  "redirects":"1"
+              })
+              request=urllib.request.Request(
+                  api+"?"+params,headers=headers
+              )
+              for attempt in range(6):
+                  try:
+                      with urllib.request.urlopen(
+                          request,timeout=35
+                      ) as response:
+                          return json.load(response)
+                  except Exception as exc:
+                      print("Nouvelle tentative :",str(exc))
+                      time.sleep(min(60,3*(2**attempt)))
+              raise RuntimeError("Wikipedia indisponible")
+
+          selected={}
+          checked=0
+
+          for start in range(0,len(ids),50):
+              batch=ids[start:start+50]
+              data=fetch(batch)
+              pages=data.get("query",{}).get("pages",{})
+
+              for page in pages.values():
+                  if "missing" in page or "invalid" in page:
+                      continue
+                  if page.get("ns")!=0:
+                      continue
+
+                  pid=page.get("pageid")
+                  title=page.get("title","").strip()
+
+                  if pid and title and pid in candidates:
+                      selected[pid]={
+                          "page_id":pid,
+                          "title":title,
+                          "views_30d":candidates[pid]
+                      }
+
+                  if len(selected)>=TARGET:
+                      break
+
+              checked+=len(batch)
+
+              if checked%1000==0:
+                  print(
+                      f"Pages verifiees : {checked} | "
+                      f"Cartes : {len(selected)}",
+                      flush=True
+                  )
+
+              if len(selected)>=TARGET:
+                  break
+
+              time.sleep(0.2)
+
+          if len(selected)<TARGET:
+              raise SystemExit(
+                  f"Seulement {len(selected)} articles valides. "
+                  "Aucun catalogue incomplet publie."
+              )
+
+          rows=list(selected.values())[:TARGET]
+
+          with open(
+              "wikiverse-catalogue-50000.csv",
+              "w",newline="",encoding="utf-8"
+          ) as f:
+              writer=csv.DictWriter(
+                  f,
+                  fieldnames=["page_id","title","views_30d"]
+              )
+              writer.writeheader()
+              writer.writerows(rows)
+
+          print("CATALOGUE TERMINE :",len(rows),"cartes")
+          PY
+
+          python -u build.py
+
+      - name: Publier le catalogue
+        uses: actions/upload-artifact@v4
+        with:
+          name: wikiverse-catalogue-50000
+          path: wikiverse-catalogue-50000.csv
+          retention-days: 30
