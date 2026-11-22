@@ -1,0 +1,35 @@
+name: WikiVerse - Catalogue
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  catalogue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installer les outils
+        run: pip install huggingface_hub pyarrow
+
+      - name: Vérifier le catalogue Wikimedia
+        run: |
+          python - <<'PY'
+          from huggingface_hub import list_repo_files
+
+          files = list_repo_files(
+              "wikimedia/structured-wikipedia",
+              repo_type="dataset"
+          )
+
+          for file in files:
+              if file.endswith(".parquet"):
+                  print(file)
+          PY
