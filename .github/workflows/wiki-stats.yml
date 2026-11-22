@@ -6,13 +6,15 @@ on:
 jobs:
   statistiques:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: Analyser les statistiques Wikimedia
+      - name: Extraire les consultations françaises
         run: |
           python - <<'PY'
           import urllib.request
           import bz2
+          from collections import Counter
 
           url = "https://dumps.wikimedia.org/other/pageview_complete/2026/2026-11/pageviews-20261119-user.bz2"
 
@@ -23,10 +25,37 @@ jobs:
               }
           )
 
+          views = Counter()
+
           with urllib.request.urlopen(req, timeout=120) as response:
               with bz2.BZ2File(response) as archive:
-                  for i in range(20):
-                      print(archive.readline().decode("utf-8"))
+                  for line in archive:
+                      parts = line.split()
 
-          print("ANALYSE TERMINEE")
+                      if len(parts) != 6:
+                          continue
+
+                      if parts[0] != b"fr.wikipedia":
+                          continue
+
+                      if not parts[2].isdigit():
+                          continue
+
+                      if not parts[4].isdigit():
+                          continue
+
+                      page_id = int(parts[2])
+                      views[page_id] += int(parts[4])
+
+          print("ARTICLES FRANCAIS :", len(views))
+          print("CONSULTATIONS :", sum(views.values()))
+
+          print("TOP 20 :")
+          for page_id, count in views.most_common(20):
+              print(page_id, count)
+
+          if not views:
+              raise RuntimeError("Aucune statistique francaise trouvee")
+
+          print("EXTRACTION REUSSIE")
           PY
