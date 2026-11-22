@@ -9,27 +9,140 @@ permissions:
 jobs:
   catalogue:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: Installer Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Installer les outils
         run: pip install huggingface_hub pyarrow
 
-      - name: Vérifier le catalogue Wikimedia
+      - name: Generer les 10000 cartes
         run: |
           python - <<'PY'
-          from huggingface_hub import list_repo_files
-
-          files = list_repo_files(
-              "wikimedia/structured-wikipedia",
-              repo_type="dataset"
+          import csv
+          import random
+          import pyarrow.parquet as pq
+          from huggingface_hub import (
+              hf_hub_download,
+              list_repo_files
           )
 
+          repo = "wikimedia/structured-wikipedia"
+
+          files = [
+              f for f in list_repo_files(
+                  repo, repo_type="dataset"
+              )
+              if f.startswith("frwiki/data/")
+              and f.endswith(".parquet")
+          ]
+
+          random.Random(42).shuffle(files)
+
+          cards = {}
+          target = 10000
+
           for file in files:
-              if file.endswith(".parquet"):
-                  print(file)
+              print("Lecture :", file, flush=True)
+
+              path = hf_hub_download(
+                  repo_id=repo,
+                  filename=file,
+                  repo_type="dataset"
+              )
+
+              parquet = pq.ParquetFile(path)
+
+              for batch in parquet.iter_batches(
+                  batch_size=2000,
+                  columns=[
+                      "identifier",
+                      "name",
+                      "abstract",
+                      "description",
+                      "image"
+                  ]
+              ):
+                  for row in batch.to_pylist():
+                      pid = row.get("identifier")
+                      title = row.get("name")
+                      image = row.get("image") or {}
+
+                      desc = (
+                          row.get("abstract")
+                          or row.get("description")
+                          or ""
+                      ).strip()
+
+                      url = image.get("content_url")
+
+                      if not pid or not title or not url:
+                          continue
+
+                      if len(desc) < 40:
+                          continue
+
+                      if not url.startswith("https://upload.wikimedia.org/"):
+                          continue
+
+                      pid = int(pid)
+
+                      if pid <= 0 or pid in cards:
+                          continue
+
+                      cards[pid] = {
+                          "page_id": pid,
+                          "title": title,
+                          "image_url": url,
+                          "description": desc[:700]
+                      }
+
+                      if len(cards) >= target:
+                          break
+
+                  if len(cards) >= target:
+                      break
+
+              print(
+                  f"Progression : {len(cards)}/{target}",
+                  flush=True
+              )
+
+              if len(cards) >= target:
+                  break
+
+          if len(cards) < target:
+              raise RuntimeError(
+                  "Catalogue incomplet"
+              )
+
+          with open(
+              "wikiverse_catalogue.csv",
+              "w",
+              encoding="utf-8",
+              newline=""
+          ) as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "page_id",
+                      "title",
+                      "image_url",
+                      "description"
+                  ]
+              )
+
+              writer.writeheader()
+              writer.writerows(cards.values())
+
+          print("CATALOGUE TERMINE :", len(cards))
           PY
+
+      - name: Exporter le catalogue
+        uses: actions/upload-artifact@v4
+        with:
+          name: WikiVerse-Catalogue-10000
+          path: wikiverse_catalogue.csv
