@@ -1,5 +1,5 @@
 
-name: WikiVerse - Catalogue 50000
+name: WikiVerse - Catalogue 30000
 
 on:
   workflow_dispatch:
@@ -19,50 +19,64 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Recuperer les statistiques
+      - name: Recuperer les statistiques existantes
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh api "repos/$GH_REPO/actions/artifacts?name=wikiverse-statistiques-30jours&per_page=100" > artifacts.json
+          gh api \
+            "repos/$GH_REPO/actions/artifacts?name=wikiverse-statistiques-30jours&per_page=100" \
+            > artifacts.json
 
           python - <<'PY'
           import json
-          a=json.load(open("artifacts.json"))["artifacts"]
-          a=[x for x in a if not x["expired"]]
-          if not a:
-              raise SystemExit("Statistiques introuvables")
-          a.sort(key=lambda x:x["created_at"],reverse=True)
-          open("artifact_id.txt","w").write(str(a[0]["id"]))
+          items=json.load(open("artifacts.json"))["artifacts"]
+          items=[x for x in items if not x["expired"]]
+          if not items:
+              raise SystemExit("Archive statistiques introuvable")
+          items.sort(key=lambda x:x["created_at"],reverse=True)
+          open("artifact_id.txt","w").write(str(items[0]["id"]))
           PY
 
           ID=$(cat artifact_id.txt)
-          gh api "repos/$GH_REPO/actions/artifacts/$ID/zip" > stats.zip
+          gh api \
+            "repos/$GH_REPO/actions/artifacts/$ID/zip" \
+            > stats.zip
           unzip -o stats.zip
 
-      - name: Construire le catalogue
+      - name: Telecharger le catalogue Wikimedia
+        run: |
+          curl -fL \
+            --retry 5 \
+            --retry-delay 15 \
+            --connect-timeout 30 \
+            "https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-page.sql.gz" \
+            -o frwiki-page.sql.gz
+
+          ls -lh frwiki-page.sql.gz
+
+      - name: Construire les 30000 cartes
         run: |
           cat > build.py <<'PY'
           import csv
           import gzip
-          import random
-          import time
-          import json
-          import urllib.parse
-          import urllib.request
           import heapq
+          import random
+          import re
 
-          SOURCE="wikiverse-views-30d.csv.gz"
-          TARGET=50000
+          TARGET=30000
           random.seed(20261122)
 
-          # Selection diversifiee : articles populaires
-          # et echantillon aleatoire.
           top=[]
           sample=[]
-          seen=0
+          count=0
 
-          with gzip.open(SOURCE,"rt",encoding="utf-8") as f:
+          print("Lecture des statistiques...",flush=True)
+
+          with gzip.open(
+              "wikiverse-views-30d.csv.gz",
+              "rt",encoding="utf-8"
+          ) as f:
               for row in csv.DictReader(f):
                   try:
                       pid=int(row["page_id"])
@@ -74,119 +88,134 @@ jobs:
                       continue
 
                   item=(pid,views)
+                  count+=1
 
                   if len(top)<10000:
                       heapq.heappush(top,(views,pid))
-                  elif views>top[0][0]:
+                  elif (views,pid)>top[0]:
                       heapq.heapreplace(top,(views,pid))
 
-                  seen+=1
-                  if len(sample)<130000:
+                  if len(sample)<180000:
                       sample.append(item)
                   else:
-                      j=random.randrange(seen)
+                      j=random.randrange(count)
                       if j<len(sample):
                           sample[j]=item
 
-          candidates={}
+          candidates={pid:views for pid,views in sample}
+
           for views,pid in top:
               candidates[pid]=views
-          for pid,views in sample:
-              candidates[pid]=views
 
-          # Melanger les pages pour eviter de ne garder
-          # que les articles les plus populaires.
-          ids=list(candidates)
-          random.shuffle(ids)
+          print(
+              "Candidats :",len(candidates),
+              flush=True
+          )
 
-          api="https://fr.wikipedia.org/w/api.php"
-          headers={
-              "User-Agent":"WikiVerseCatalogue/2.0 (GitHub Actions; educational game)",
-              "Accept":"application/json"
+          # Lire les INSERT du dump page.sql Wikimedia.
+          # Seules les pages de l'espace principal (ns=0)
+          # seront retenues.
+          pattern=re.compile(
+              rb"\((\d+),0,'((?:\\.|[^'\\])*)',"
+          )
+
+          def decode_title(raw):
+              out=bytearray()
+              i=0
+              while i<len(raw):
+                  if raw[i]==92 and i+1<len(raw):
+                      c=raw[i+1]
+                      mapping={
+                          48:0,98:8,110:10,114:13,
+                          116:9,90:26
+                      }
+                      out.append(mapping.get(c,c))
+                      i+=2
+                  else:
+                      out.append(raw[i])
+                      i+=1
+              return out.decode("utf-8","replace").replace("_"," ")
+
+          found={}
+          scanned=0
+
+          print("Lecture du dump Wikimedia...",flush=True)
+
+          with gzip.open("frwiki-page.sql.gz","rb") as f:
+              for line in f:
+                  if not line.startswith(b"INSERT INTO"):
+                      continue
+
+                  for match in pattern.finditer(line):
+                      scanned+=1
+                      pid=int(match.group(1))
+
+                      if pid not in candidates:
+                          continue
+
+                      title=decode_title(match.group(2)).strip()
+
+                      if title and "\ufffd" not in title:
+                          found[pid]=(
+                              title,candidates[pid]
+                          )
+
+                  if scanned and scanned%1000000<100:
+                      print(
+                          "Pages examinees :",scanned,
+                          "| Correspondances :",len(found),
+                          flush=True
+                      )
+
+          print(
+              "Correspondances totales :",len(found),
+              flush=True
+          )
+
+          if len(found)<TARGET:
+              raise SystemExit(
+                  "Moins de 30000 pages trouvees : "
+                  "aucun fichier incomplet publie."
+              )
+
+          # Inclure les pages populaires puis completer
+          # avec une selection diversifiee.
+          popular_ids={
+              pid for views,pid in top
+              if pid in found
           }
 
-          def fetch(batch):
-              params=urllib.parse.urlencode({
-                  "action":"query",
-                  "format":"json",
-                  "pageids":"|".join(map(str,batch)),
-                  "redirects":"1"
-              })
-              request=urllib.request.Request(
-                  api+"?"+params,headers=headers
-              )
-              for attempt in range(6):
-                  try:
-                      with urllib.request.urlopen(
-                          request,timeout=35
-                      ) as response:
-                          return json.load(response)
-                  except Exception as exc:
-                      print("Nouvelle tentative :",str(exc))
-                      time.sleep(min(60,3*(2**attempt)))
-              raise RuntimeError("Wikipedia indisponible")
+          popular=sorted(
+              popular_ids,
+              key=lambda pid:found[pid][1],
+              reverse=True
+          )[:8000]
 
-          selected={}
-          checked=0
+          remaining=[
+              pid for pid in found
+              if pid not in set(popular)
+          ]
+          random.shuffle(remaining)
 
-          for start in range(0,len(ids),50):
-              batch=ids[start:start+50]
-              data=fetch(batch)
-              pages=data.get("query",{}).get("pages",{})
-
-              for page in pages.values():
-                  if "missing" in page or "invalid" in page:
-                      continue
-                  if page.get("ns")!=0:
-                      continue
-
-                  pid=page.get("pageid")
-                  title=page.get("title","").strip()
-
-                  if pid and title and pid in candidates:
-                      selected[pid]={
-                          "page_id":pid,
-                          "title":title,
-                          "views_30d":candidates[pid]
-                      }
-
-                  if len(selected)>=TARGET:
-                      break
-
-              checked+=len(batch)
-
-              if checked%1000==0:
-                  print(
-                      f"Pages verifiees : {checked} | "
-                      f"Cartes : {len(selected)}",
-                      flush=True
-                  )
-
-              if len(selected)>=TARGET:
-                  break
-
-              time.sleep(0.2)
-
-          if len(selected)<TARGET:
-              raise SystemExit(
-                  f"Seulement {len(selected)} articles valides. "
-                  "Aucun catalogue incomplet publie."
-              )
-
-          rows=list(selected.values())[:TARGET]
+          chosen=popular+remaining[:TARGET-len(popular)]
+          random.shuffle(chosen)
 
           with open(
-              "wikiverse-catalogue-50000.csv",
+              "wikiverse-catalogue-30000.csv",
               "w",newline="",encoding="utf-8"
           ) as f:
-              writer=csv.DictWriter(
-                  f,
-                  fieldnames=["page_id","title","views_30d"]
-              )
-              writer.writeheader()
-              writer.writerows(rows)
+              writer=csv.writer(f)
+              writer.writerow([
+                  "page_id","title","views_30d"
+              ])
+              for pid in chosen:
+                  title,views=found[pid]
+                  writer.writerow([pid,title,views])
 
-          print("CATALOGUE TERMINE :",len(rows),"cartes")
+          print(
+              "SUCCES : 30000 cartes exportees",
+              flush=True
+          )
           PY
 
           python -u build.py
@@ -194,6 +223,6 @@ jobs:
       - name: Publier le catalogue
         uses: actions/upload-artifact@v4
         with:
-          name: wikiverse-catalogue-50000
-          path: wikiverse-catalogue-50000.csv
+          name: wikiverse-catalogue-30000
+          path: wikiverse-catalogue-30000.csv
           retention-days: 30
